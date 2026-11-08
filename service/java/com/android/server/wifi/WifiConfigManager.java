@@ -266,14 +266,14 @@ public class WifiConfigManager {
     /**
      * Enforce a minimum time to wait after the last disconnect to generate a new randomized MAC,
      * since IPv6 networks don't provide the DHCP lease duration.
-     * 4 hours.
+     * 25 minutes.
      */
     @VisibleForTesting
-    protected static final long NON_PERSISTENT_MAC_WAIT_AFTER_DISCONNECT_MS = 4 * 60 * 60 * 1000;
+    protected static final long NON_PERSISTENT_MAC_WAIT_AFTER_DISCONNECT_MS = 25 * 60 * 1000;
     @VisibleForTesting
-    protected static final long NON_PERSISTENT_MAC_REFRESH_MS_MIN = 30 * 60 * 1000; // 30 minutes
+    protected static final long NON_PERSISTENT_MAC_REFRESH_MS_MIN = 20 * 60 * 1000; // 20 minutes
     @VisibleForTesting
-    protected static final long NON_PERSISTENT_MAC_REFRESH_MS_MAX = 24 * 60 * 60 * 1000; // 24 hours
+    protected static final long NON_PERSISTENT_MAC_REFRESH_MS_MAX = 30 * 60 * 1000; // 30 minutes
 
     private static final MacAddress DEFAULT_MAC_ADDRESS =
             MacAddress.fromString(WifiInfo.DEFAULT_MAC_ADDRESS);
@@ -563,6 +563,10 @@ public class WifiConfigManager {
      * @return
      */
     public boolean shouldUseNonPersistentRandomization(WifiConfiguration config) {
+        if (config.macRandomizationSetting == WifiConfiguration.RANDOMIZATION_ALWAYS) {
+            return true;
+        }
+
         if (!isMacRandomizationSupported()
                 || config.macRandomizationSetting == WifiConfiguration.RANDOMIZATION_NONE) {
             return false;
@@ -716,7 +720,8 @@ public class WifiConfigManager {
     private MacAddress updateRandomizedMacIfNeeded(WifiConfiguration config) {
         boolean shouldUpdateMac = config.randomizedMacExpirationTimeMs
                 < mClock.getWallClockMillis() || mClock.getWallClockMillis()
-                - config.randomizedMacLastModifiedTimeMs >= NON_PERSISTENT_MAC_REFRESH_MS_MAX;
+                - config.randomizedMacLastModifiedTimeMs >= NON_PERSISTENT_MAC_REFRESH_MS_MAX ||
+                config.macRandomizationSetting == WifiConfiguration.RANDOMIZATION_ALWAYS;
         if (!shouldUpdateMac) {
             return config.getRandomizedMacAddress();
         }

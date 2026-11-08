@@ -74,6 +74,8 @@ import android.annotation.CheckResult;
 import android.annotation.IntDef;
 import android.annotation.NonNull;
 import android.annotation.Nullable;
+import android.app.AlarmManager;
+import android.app.AlarmManager.OnAlarmListener;
 import android.app.AppOpsManager;
 import android.app.admin.DevicePolicyManager;
 import android.app.admin.WifiSsidPolicy;
@@ -91,6 +93,7 @@ import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
 import android.content.res.Resources;
+import android.database.ContentObserver;
 import android.hardware.wifi.WifiStatusCode;
 import android.location.LocationManager;
 import android.net.DhcpInfo;
@@ -196,6 +199,7 @@ import android.os.PowerManager;
 import android.os.Process;
 import android.os.RemoteCallbackList;
 import android.os.RemoteException;
+import android.os.SystemClock;
 import android.os.UserHandle;
 import android.os.UserManager;
 import android.os.WorkSource;
@@ -292,6 +296,9 @@ public class WifiServiceImpl extends IWifiManager.Stub {
     static final int AUTO_DISABLE_SHOW_KEY_COUNTDOWN_MILLIS = 24 * 60 * 60 * 1000;
     private static final int CHANNEL_USAGE_WEAK_SCAN_RSSI_DBM = -80;
 
+    // Settings.Global.WIFI_OFF_TIMEOUT
+    private static final String WIFI_OFF_TIMEOUT = "wifi_off_timeout";
+
     private static final int SCORER_BINDING_STATE_INVALID = -1;
     // The system is brining up the scorer service.
     private static final int SCORER_BINDING_STATE_BRINGING_UP = 0;
@@ -383,6 +390,16 @@ public class WifiServiceImpl extends IWifiManager.Stub {
     private final BuildProperties mBuildProperties;
 
     private final DefaultClientModeManager mDefaultClientModeManager;
+
+    private final OnAlarmListener mWifiTimeoutListener = new OnAlarmListener() {
+        @Override
+        public void onAlarm() {
+            if (getWifiEnabledState() == WifiManager.WIFI_STATE_ENABLED
+                    && getCurrentNetwork() == null) {
+                setWifiEnabled(mContext.getPackageName(), false);
+            }
+        }
+    };
 
     private final FeatureFlags mFeatureFlags;
     @VisibleForTesting
@@ -1083,6 +1100,8 @@ public class WifiServiceImpl extends IWifiManager.Stub {
             intentFilter.addAction(BluetoothAdapter.ACTION_CONNECTION_STATE_CHANGED);
             intentFilter.addAction(BluetoothAdapter.ACTION_STATE_CHANGED);
             intentFilter.addAction(PowerManager.ACTION_DEVICE_IDLE_MODE_CHANGED);
+            intentFilter.addAction(WifiManager.NETWORK_STATE_CHANGED_ACTION);
+            intentFilter.addAction(WifiManager.WIFI_STATE_CHANGED_ACTION);
             registerBroadcastReceiver(
                     new BroadcastReceiver() {
                         @Override
@@ -1130,6 +1149,9 @@ public class WifiServiceImpl extends IWifiManager.Stub {
                             } else if (PowerManager.ACTION_DEVICE_IDLE_MODE_CHANGED
                                     .equals(action)) {
                                 handleIdleModeChanged();
+                            } else if (action.equals(WifiManager.NETWORK_STATE_CHANGED_ACTION) ||
+                                    action.equals(WifiManager.WIFI_STATE_CHANGED_ACTION)) {
+                                setWifiTimeout();
                             }
                         }
                     },
@@ -1163,6 +1185,17 @@ public class WifiServiceImpl extends IWifiManager.Stub {
             mWifiInjector.getPasspointManager().handleBootCompleted();
             mWifiInjector.getInterfaceConflictManager().handleBootCompleted();
             mWifiInjector.getHalDeviceManager().handleBootCompleted();
+            mContext.getContentResolver().registerContentObserver(
+                    Settings.Global.getUriFor(WIFI_OFF_TIMEOUT),
+                    false,
+                    new ContentObserver(new Handler(mContext.getMainLooper())) {
+                        @Override
+                        public void onChange(boolean selfChange) {
+                            super.onChange(selfChange);
+                            setWifiTimeout();
+                        }
+                    }
+            );
             // HW capabilities is ready after boot completion.
             if (!mWifiGlobals.isInsecureEnterpriseConfigurationAllowed()) {
                 mWifiConfigManager.updateTrustOnFirstUseFlag(isTrustOnFirstUseSupported());
@@ -1260,6 +1293,19 @@ public class WifiServiceImpl extends IWifiManager.Stub {
                 mSettingsConfigStore.handleUserStop(userId);
             }
         }, TAG + "#handleUserStop");
+    }
+
+    private void setWifiTimeout() {
+        long wifiTimeoutMillis = Settings.Global.getLong(mContext.getContentResolver(),
+                WIFI_OFF_TIMEOUT, 0);
+        AlarmManager alarmManager = mContext.getSystemService(AlarmManager.class);
+        alarmManager.cancel(mWifiTimeoutListener);
+        if (wifiTimeoutMillis != 0) {
+            final long timeout = SystemClock.elapsedRealtime() + wifiTimeoutMillis;
+            alarmManager.setExactAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP, timeout,
+                    TAG, new HandlerExecutor(new Handler(mContext.getMainLooper())), null,
+                    mWifiTimeoutListener);
+        }
     }
 
     /**
@@ -2124,8 +2170,12 @@ public class WifiServiceImpl extends IWifiManager.Stub {
      */
     @Override
     public boolean validateSoftApConfiguration(SoftApConfiguration config) {
-        int pid = Binder.getCallingPid();
-        int uid = Binder.getCallingUid();
+        return validateSoftApConfigurationInternal(config, Binder.getCallingUid(),
+                Binder.getCallingPid());
+    }
+
+    private boolean validateSoftApConfigurationInternal(SoftApConfiguration config,
+            int uid, int pid) {
         boolean privileged = isSettingsOrSuw(pid, uid)
                 || checkNetworkStackPermission(pid, uid)
                 || checkMainlineNetworkStackPermission(pid, uid);
@@ -2198,9 +2248,10 @@ public class WifiServiceImpl extends IWifiManager.Stub {
         }
 
         if (!startSoftApInternal(new SoftApModeConfiguration(
-                WifiManager.IFACE_IP_MODE_TETHERED, softApConfig,
-                mTetheredSoftApTracker.getSoftApCapability(),
-                mCountryCode.getCountryCode(), null), requestorWs, null)) {
+                        WifiManager.IFACE_IP_MODE_TETHERED, softApConfig,
+                        mTetheredSoftApTracker.getSoftApCapability(),
+                        mCountryCode.getCountryCode(), null),
+                requestorWs, null, callingUid, Binder.getCallingPid())) {
             mTetheredSoftApTracker.setFailedWhileEnabling();
             return false;
         }
@@ -2233,9 +2284,10 @@ public class WifiServiceImpl extends IWifiManager.Stub {
 
         mLog.info("startTetheredHotspot uid=%").c(callingUid).flush();
         return startTetheredHotspotInternal(new SoftApModeConfiguration(
-                WifiManager.IFACE_IP_MODE_TETHERED, softApConfig,
-                mTetheredSoftApTracker.getSoftApCapability(),
-                mCountryCode.getCountryCode(), null /* request */), callingUid, packageName, null);
+                        WifiManager.IFACE_IP_MODE_TETHERED, softApConfig,
+                        mTetheredSoftApTracker.getSoftApCapability(),
+                        mCountryCode.getCountryCode(), null /* request */),
+                callingUid, Binder.getCallingPid(), packageName, null);
     }
 
     /**
@@ -2275,11 +2327,12 @@ public class WifiServiceImpl extends IWifiManager.Stub {
 
         mLog.info("startTetheredHotspot uid=%").c(callingUid).flush();
         startTetheredHotspotInternal(new SoftApModeConfiguration(
-                WifiManager.IFACE_IP_MODE_TETHERED,
-                com.android.net.flags.Flags.tetheringWithSoftApConfig()
-                        ? request.getSoftApConfiguration() : null,
-                mTetheredSoftApTracker.getSoftApCapability(),
-                mCountryCode.getCountryCode(), request), callingUid, packageName, callback);
+                        WifiManager.IFACE_IP_MODE_TETHERED,
+                        com.android.net.flags.Flags.tetheringWithSoftApConfig()
+                                ? request.getSoftApConfiguration() : null,
+                        mTetheredSoftApTracker.getSoftApCapability(),
+                        mCountryCode.getCountryCode(), request),
+                callingUid, Binder.getCallingPid(), packageName, callback);
     }
 
     private void sendSoftApCallbackStartFailure(@Nullable ISoftApCallback callback,
@@ -2298,7 +2351,8 @@ public class WifiServiceImpl extends IWifiManager.Stub {
      * proper permissions beyond the NetworkStack permission.
      */
     private boolean startTetheredHotspotInternal(@NonNull SoftApModeConfiguration modeConfig,
-            int callingUid, String packageName, @Nullable ISoftApCallback callback) {
+            int callingUid, int callingPid, String packageName,
+            @Nullable ISoftApCallback callback) {
         TetheringManager.TetheringRequest tetheringRequest = modeConfig.getTetheringRequest();
         if (mActiveModeWarden.isSoftApRestartingForCcChange(IFACE_IP_MODE_TETHERED)) {
             mLog.err("Tethering is in the middle of restarting for CC change.").flush();
@@ -2322,12 +2376,12 @@ public class WifiServiceImpl extends IWifiManager.Stub {
             Binder.restoreCallingIdentity(id);
         }
 
-        if (!startSoftApInternal(modeConfig, requestorWs, callback)) {
+        if (!startSoftApInternal(modeConfig, requestorWs, callback, callingUid, callingPid)) {
             mTetheredSoftApTracker.setFailedWhileEnabling();
             return false;
         }
         mLastCallerInfoManager.put(WifiManager.API_TETHERED_HOTSPOT, Process.myTid(),
-                callingUid, Binder.getCallingPid(), packageName, true);
+                callingUid, callingPid, packageName, true);
         return true;
     }
 
@@ -2336,15 +2390,14 @@ public class WifiServiceImpl extends IWifiManager.Stub {
      * proper permissions beyond the NetworkStack permission.
      */
     private boolean startSoftApInternal(SoftApModeConfiguration apConfig, WorkSource requestorWs,
-            @Nullable ISoftApCallback callback) {
-        int uid = Binder.getCallingUid();
-        mLog.trace("startSoftApInternal uid=% mode=%")
-                .c(uid).c(apConfig.getTargetMode()).flush();
+            @Nullable ISoftApCallback callback, int uid, int pid) {
+        mLog.trace("startSoftApInternal uid=% pid=% mode=%")
+                .c(uid).c(pid).c(apConfig.getTargetMode()).flush();
 
         // null wifiConfig is a meaningful input for CMD_SET_AP; it means to use the persistent
         // AP config.
         SoftApConfiguration softApConfig = apConfig.getSoftApConfiguration();
-        if (softApConfig != null && !validateSoftApConfiguration(softApConfig)) {
+        if (softApConfig != null && !validateSoftApConfigurationInternal(softApConfig, uid, pid)) {
             Log.e(TAG, "Invalid SoftApConfiguration");
             if (callback != null) {
                 try {
@@ -3136,8 +3189,14 @@ public class WifiServiceImpl extends IWifiManager.Stub {
             mActiveConfig = new SoftApModeConfiguration(
                     WifiManager.IFACE_IP_MODE_LOCAL_ONLY,
                     softApConfig, lohsCapability, mCountryCode.getCountryCode(), null);
+            int uid = -1;
+            WorkSource ws = request.getWorkSource();
+            if (ws != null && !ws.isEmpty()) {
+                uid = ws.getUid(0);
+            }
+            int pid = request.getPid();
             // Report the error if we got failure in startSoftApInternal
-            if (!startSoftApInternal(mActiveConfig, request.getWorkSource(), null)) {
+            if (!startSoftApInternal(mActiveConfig, request.getWorkSource(), null, uid, pid)) {
                 onStateChanged(new SoftApState(
                         WIFI_AP_STATE_FAILED, SAP_START_FAILURE_GENERAL,
                         mActiveConfig.getTetheringRequest(), null /* iface */));
@@ -3449,7 +3508,10 @@ public class WifiServiceImpl extends IWifiManager.Stub {
                 return LocalOnlyHotspotCallback.ERROR_INCOMPATIBLE_MODE;
             }
             // check if we are currently tethering
-            if (!mActiveModeWarden.canRequestMoreSoftApManagers(requestorWs)
+            // Prevent deadlock when driver continuously fails
+            boolean canRequestMoreSoftApManagers = mWifiThreadRunner.call(
+                () -> mActiveModeWarden.canRequestMoreSoftApManagers(requestorWs), false);
+            if (!canRequestMoreSoftApManagers
                     && mTetheredSoftApTracker.getState().getState() == WIFI_AP_STATE_ENABLED) {
                 // Tethering is enabled, cannot start LocalOnlyHotspot
                 mLog.info("Cannot start localOnlyHotspot when WiFi Tethering is active.")
